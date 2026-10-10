@@ -1,4 +1,5 @@
 import { z } from "npm:zod@3.23.8";
+import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -11,6 +12,26 @@ function json(body: unknown, status = 200) {
     status,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
+}
+
+// ---------- Daily usage cap (fail closed) ----------
+async function checkUsage(fn: string): Promise<Response | null> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!supabaseUrl || !serviceRoleKey) {
+    return json({ error: "Server misconfiguration: cannot verify usage" }, 503);
+  }
+  const admin = createClient(supabaseUrl, serviceRoleKey);
+  const today = new Date().toISOString().slice(0, 10);
+  const { data, error } = await admin.rpc("increment_usage", { fn, day: today });
+  if (error || typeof data !== "number") {
+    return json({ error: "Usage counter unavailable" }, 503);
+  }
+  const limit = parseInt(Deno.env.get("DAILY_CALL_LIMIT") ?? "200", 10);
+  if (data > limit) {
+    return json({ error: "daily_limit" }, 429);
+  }
+  return null;
 }
 
 const explainSchema = z.object({
@@ -65,8 +86,7 @@ function mockExplain(claim: string, passage: string, verdict: string, codeChecks
     uncertain: "There is not enough information in the passage to decide.",
   };
   const first = `The passage was matched to this claim because of shared wording; ${verdictLine[verdict] ?? verdictLine.uncertain}${numberNote}${quoteNote}`;
-  const fix = verdict !== "supported" && passage ? null : null;
-  return { reasoning: first, suggested_fix: fix };
+  return { reasoning: first, suggested_fix: null };
 }
 
 Deno.serve(async (req: Request) => {
@@ -85,14 +105,15 @@ Deno.serve(async (req: Request) => {
       return json({ ...mockExplain(claim, passage, verdict, code_checks), mode: "mock" });
     }
 
+    // Usage cap — checked before any upstream OpenAI call
+    const capResp = await checkUsage("explain");
+    if (capResp) return capResp;
+
     const model = Deno.env.get("OPENAI_MODEL") ?? "gpt-6-luna";
     const baseUrl = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
-      {
-        role: "user",
-        content: `Claim: ${claim}\n\nMatched passage: ${passage}\n\nVerdict: ${verdict}\n\nCode checks: ${JSON.stringify(code_checks ?? {})}`,
-      },
+      { role: "user", content: `Claim: ${claim}\n\nMatched passage: ${passage}\n\nVerdict: ${verdict}\n\nCode checks: ${JSON.stringify(code_checks ?? {})}` },
     ];
 
     let lastError: Error | null = null;

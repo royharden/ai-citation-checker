@@ -77,10 +77,22 @@ export async function runCheck(opts: RunOptions): Promise<CheckReport> {
     onStage("jev", { status: "done", ms: Date.now() - jevStart, calls: jevResults.length * 2 });
   } catch (e) {
     verifyError = e instanceof Error ? e.message : String(e);
+    // Detect daily_limit from 429 — the invokeFn wrapper extracts error.context.error
+    const isDailyLimit = verifyError === "daily_limit";
+    const hasRecorded = !!opts.recordedJev && Object.keys(opts.recordedJev).length > 0;
+    if (isDailyLimit && hasRecorded) {
+      jevMode = "replay";
+      onStage("notice", { message: "Daily demo limit reached — switching to Replay mode" });
+      verifyError = null;
+    } else if (isDailyLimit) {
+      onStage("notice", { message: "Daily demo limit reached — live Jev calls are capped at 200 per day" });
+      verifyError = null;
+      jevMode = "replay"; // will produce empty results but won't crash
+    }
   }
 
-  const hasRecorded = !!opts.recordedJev && Object.keys(opts.recordedJev).length > 0;
   if (verifyError) {
+    const hasRecorded = !!opts.recordedJev && Object.keys(opts.recordedJev).length > 0;
     if (hasRecorded) {
       jevMode = "replay";
       onStage("notice", { message: `${verifyError} — using recorded Jev answers (Replay mode)` });

@@ -1,4 +1,5 @@
 import { z } from "npm:zod@3.23.8";
+import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -11,6 +12,26 @@ function json(body: unknown, status = 200) {
     status,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });
+}
+
+// ---------- Daily usage cap (fail closed) ----------
+async function checkUsage(fn: string): Promise<Response | null> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!supabaseUrl || !serviceRoleKey) {
+    return json({ error: "Server misconfiguration: cannot verify usage" }, 503);
+  }
+  const admin = createClient(supabaseUrl, serviceRoleKey);
+  const today = new Date().toISOString().slice(0, 10);
+  const { data, error } = await admin.rpc("increment_usage", { fn, day: today });
+  if (error || typeof data !== "number") {
+    return json({ error: "Usage counter unavailable" }, 503);
+  }
+  const limit = parseInt(Deno.env.get("DAILY_CALL_LIMIT") ?? "200", 10);
+  if (data > limit) {
+    return json({ error: "daily_limit" }, 429);
+  }
+  return null;
 }
 
 const claimSchema = z.object({
@@ -35,19 +56,11 @@ Rules:
 - Skip opinions, filler, questions, and greetings.
 - Maximum 40 claims. Return JSON: {"claims": [{"id": "claim_0", ...}]}.`;
 
-// ---- OpenAI call (no temperature, ever) ----
 async function chatJson(apiKey: string, baseUrl: string, model: string, messages: { role: string; content: string }[]): Promise<string> {
   const res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      response_format: { type: "json_object" },
-    }),
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model, messages, response_format: { type: "json_object" } }),
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
@@ -63,45 +76,30 @@ async function chatJson(apiKey: string, baseUrl: string, model: string, messages
 
 function extractJson(text: string): unknown {
   const trimmed = text.trim();
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    // tolerate fenced or prefixed JSON
+  try { return JSON.parse(trimmed); } catch {
     const start = trimmed.indexOf("{");
     const end = trimmed.lastIndexOf("}");
-    if (start !== -1 && end > start) {
-      return JSON.parse(trimmed.slice(start, end + 1));
-    }
+    if (start !== -1 && end > start) return JSON.parse(trimmed.slice(start, end + 1));
     throw new Error("Could not parse JSON from model output");
   }
 }
 
-// ---- Mock splitter ----
 function mockSplit(answer: string): ClaimOut[] {
   const claims: ClaimOut[] = [];
-  // Split into sentences on '. ', '! ', '? ' keeping terminators.
   const sentences = answer.match(/[^.!?]+[.!?]+["')\]]*|\S+$/g) ?? [answer];
   let i = 0;
   for (const raw of sentences) {
     const sentence = raw.trim();
     if (sentence.length < 8) continue;
-    // quotes inside the sentence
     const quoted = sentence.match(/"([^"]{3,})"/g);
     if (quoted) {
       for (const q of quoted) {
         const inner = q.slice(1, -1);
         const marker = sentence.match(/\[\d+\]|https?:\/\/\S+|\([^)]*\)/)?.[0] ?? null;
-        claims.push({
-          id: `claim_${i}`,
-          kind: "quote",
-          text: sentence,
-          quote_text: inner,
-          cited_source: marker,
-        });
+        claims.push({ id: `claim_${i}`, kind: "quote", text: sentence, quote_text: inner, cited_source: marker });
         i++;
       }
     }
-    // skip pure opinions / short interjections
     if (/^(i think|i feel|maybe|perhaps|hello|thanks)/i.test(sentence)) continue;
     const marker = sentence.match(/\[\d+\]|https?:\/\/\S+/)?.[0] ?? null;
     claims.push({ id: `claim_${i}`, kind: "claim", text: sentence, quote_text: null, cited_source: marker });
@@ -126,9 +124,12 @@ Deno.serve(async (req: Request) => {
       return json({ claims: mockSplit(answer), mode: "mock", note: "OPENAI_API_KEY not set — used rule-based claim splitter" });
     }
 
+    // Usage cap — checked before any upstream OpenAI call
+    const capResp = await checkUsage("extract-claims");
+    if (capResp) return capResp;
+
     const model = Deno.env.get("OPENAI_MODEL") ?? "gpt-6-luna";
     const baseUrl = Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1";
-
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: `Answer:\n\n${answer}` },
@@ -142,7 +143,6 @@ Deno.serve(async (req: Request) => {
         return json({ claims: parsed.claims, mode: "live", model });
       } catch (e) {
         lastError = e instanceof Error ? e : new Error(String(e));
-        // Only retry on parse/validation failure; surface API errors immediately
         if (lastError.message.startsWith("OpenAI")) throw lastError;
       }
     }

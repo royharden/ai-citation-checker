@@ -11,8 +11,30 @@ function json(body: unknown, status = 200) {
   });
 }
 
+import { createClient } from "npm:@supabase/supabase-js@2.57.4";
+
 const JEVMODEL = "jev-1.13.0";
 const TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone";
+
+// ---------- Daily usage cap (fail closed) ----------
+async function checkUsage(fn: string): Promise<Response | null> {
+  const supabaseUrl = Deno.env.get("SUPABASE_URL");
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!supabaseUrl || !serviceRoleKey) {
+    return json({ error: "Server misconfiguration: cannot verify usage" }, 503);
+  }
+  const admin = createClient(supabaseUrl, serviceRoleKey);
+  const today = new Date().toISOString().slice(0, 10);
+  const { data, error } = await admin.rpc("increment_usage", { fn, day: today });
+  if (error || typeof data !== "number") {
+    return json({ error: "Usage counter unavailable" }, 503);
+  }
+  const limit = parseInt(Deno.env.get("DAILY_CALL_LIMIT") ?? "200", 10);
+  if (data > limit) {
+    return json({ error: "daily_limit" }, 429);
+  }
+  return null;
+}
 
 // ---------- BM25 (pure TS, k1=1.2 b=0.75) ----------
 const STOP = new Set(["the", "a", "an", "of", "in", "on", "at", "to", "for", "and", "or", "is", "are", "was", "were", "be", "been", "by", "with", "that", "this", "it", "as", "from"]);
@@ -213,6 +235,10 @@ Deno.serve(async (req: Request) => {
     if (!apiKey) {
       return json({ error: "TYPESAFE_API_KEY is not configured. Live Jev verification needs a TypeSafe API key — Replay mode with a built-in demo works without one." }, 503);
     }
+
+    // Usage cap — checked before any upstream TypeSafe call
+    const capResp = await checkUsage("jev-verify");
+    if (capResp) return capResp;
 
     const allPassages = buildPassages(sources as any);
     if (allPassages.length === 0) return json({ error: "No source content to build passages from" }, 422);
