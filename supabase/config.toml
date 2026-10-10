@@ -1,0 +1,14 @@
+# Supabase config for the Citation Checker demo
+project_id = "citation-checker"
+
+[functions.fetch-sources]
+verify_jwt = true
+
+[functions.extract-claims]
+verify_jwt = true
+
+[functions.jev-verify]
+verify_jwt = true
+
+[functions.explain]
+verify_jwt = true
