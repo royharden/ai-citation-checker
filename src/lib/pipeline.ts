@@ -1,5 +1,5 @@
-import { invokeFn, supabase } from "./supabaseClient";
-import type { RawClaim, Source, JevVerifyResult, Verdict, ClaimReport, CheckReport, Passage } from "./types";
+import { invokeFn, supabase, supabaseConfigured } from "./supabaseClient";
+import type { RawClaim, Source, JevVerifyResult, Verdict, ClaimReport, CheckReport, Passage, CodeChecks } from "./types";
 import { runCodeChecks, adjustVerdict, trustScore } from "./checks";
 
 export function findCharSpan(answer: string, text: string): { start: number; end: number } | null {
@@ -34,6 +34,53 @@ export function estimateLlmJudgeCost(numClaims: number): number {
   return numClaims * (LLM_JUDGE_INPUT_TOKENS * LLM_JUDGE_INPUT + LLM_JUDGE_OUTPUT_TOKENS * LLM_JUDGE_OUTPUT);
 }
 
+// ---- Local fallbacks (used when Supabase is not configured) ----
+function mockSplit(answer: string): RawClaim[] {
+  const claims: RawClaim[] = [];
+  const sentences = answer.match(/[^.!?]+[.!?]+["')\]]*|\S+$/g) ?? [answer];
+  let i = 0;
+  for (const raw of sentences) {
+    const sentence = raw.trim();
+    if (sentence.length < 8) continue;
+    const quoted = sentence.match(/"([^"]{3,})"/g);
+    if (quoted) {
+      for (const q of quoted) {
+        const inner = q.slice(1, -1);
+        const marker = sentence.match(/\[\d+\]|https?:\/\/\S+|\([^)]*\)/)?.[0] ?? null;
+        claims.push({ id: `claim_${i}`, kind: "quote", text: sentence, quote_text: inner, cited_source: marker });
+        i++;
+      }
+    }
+    if (/^(i think|i feel|maybe|perhaps|hello|thanks)/i.test(sentence)) continue;
+    const marker = sentence.match(/\[\d+\]|https?:\/\/\S+/)?.[0] ?? null;
+    claims.push({ id: `claim_${i}`, kind: "claim", text: sentence, quote_text: null, cited_source: marker });
+    i++;
+    if (i >= 40) break;
+  }
+  return claims;
+}
+
+const VERDICT_LINE: Record<string, string> = {
+  supported: "The passage states the facts in this claim.",
+  partially_supported: "The passage backs up part of the claim, but some detail is missing or overstated.",
+  unsupported: "The passage does not mention what the claim says.",
+  contradicted: "The passage says the opposite of the claim.",
+  misquoted: "The quotation does not match the words or meaning in the passage.",
+  uncertain: "There is not enough information in the passage to decide.",
+};
+
+function mockReasoning(verdict: Verdict, checks: CodeChecks): string {
+  const numberNote = checks.number?.mismatch
+    ? ` The passage reports ${checks.number.passage_value} where the claim says ${checks.number.claim_value}.`
+    : "";
+  const quoteNote = checks.quote?.status === "exact"
+    ? " The quoted words appear in the passage."
+    : checks.quote?.status === "close"
+      ? ` The quote is a close paraphrase (${checks.quote.similarity}%) rather than exact.`
+      : "";
+  return `The passage was matched to this claim because of shared wording; ${VERDICT_LINE[verdict] ?? VERDICT_LINE.uncertain}${numberNote}${quoteNote}`;
+}
+
 export interface RunOptions {
   answer: string;
   sources: Source[];
@@ -50,7 +97,19 @@ export async function runCheck(opts: RunOptions): Promise<CheckReport> {
   // ---- Stage: extract claims ----
   onStage("extract", { status: "running" });
   const extractStart = Date.now();
-  const extractRes = await invokeFn<{ claims: RawClaim[]; mode: "live" | "mock"; note?: string }>("extract-claims", { answer });
+  let extractRes: { claims: RawClaim[]; mode: "live" | "mock"; note?: string };
+  if (supabaseConfigured) {
+    try {
+      extractRes = await invokeFn<{ claims: RawClaim[]; mode: "live" | "mock"; note?: string }>("extract-claims", { answer });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      onStage("notice", { message: `${msg} — using built-in claim splitter` });
+      extractRes = { claims: mockSplit(answer), mode: "mock", note: undefined };
+    }
+  } else {
+    onStage("notice", { message: "Supabase not configured — using built-in claim splitter (Mock mode)" });
+    extractRes = { claims: mockSplit(answer), mode: "mock", note: undefined };
+  }
   const extractMs = Date.now() - extractStart;
   const llmMode: "live" | "mock" = extractRes.mode === "live" ? "live" : "mock";
   if (extractRes.note) onStage("notice", { message: extractRes.note });
@@ -68,27 +127,31 @@ export async function runCheck(opts: RunOptions): Promise<CheckReport> {
   let verifyError: string | null = null;
 
   const jevStart = Date.now();
-  try {
-    const res = await invokeFn<{ results: JevVerifyResult[] }>("jev-verify", {
-      claims: withSpans.map((c) => ({ id: c.id, kind: c.kind, text: c.text, quote_text: c.quote_text, cited_source: c.cited_source })),
-      sources: labeled.map((s) => ({ label: s.label, title: s.title, content: s.content })),
-    });
-    jevResults = res.results;
-    onStage("jev", { status: "done", ms: Date.now() - jevStart, calls: jevResults.length * 2 });
-  } catch (e) {
-    verifyError = e instanceof Error ? e.message : String(e);
-    // Detect daily_limit from 429 — the invokeFn wrapper extracts error.context.error
-    const isDailyLimit = verifyError === "daily_limit";
-    const hasRecorded = !!opts.recordedJev && Object.keys(opts.recordedJev).length > 0;
-    if (isDailyLimit && hasRecorded) {
-      jevMode = "replay";
-      onStage("notice", { message: "Daily demo limit reached — switching to Replay mode" });
-      verifyError = null;
-    } else if (isDailyLimit) {
-      onStage("notice", { message: "Daily demo limit reached — live Jev calls are capped at 200 per day" });
-      verifyError = null;
-      jevMode = "replay"; // will produce empty results but won't crash
+  if (supabaseConfigured) {
+    try {
+      const res = await invokeFn<{ results: JevVerifyResult[] }>("jev-verify", {
+        claims: withSpans.map((c) => ({ id: c.id, kind: c.kind, text: c.text, quote_text: c.quote_text, cited_source: c.cited_source })),
+        sources: labeled.map((s) => ({ label: s.label, title: s.title, content: s.content })),
+      });
+      jevResults = res.results;
+      onStage("jev", { status: "done", ms: Date.now() - jevStart, calls: jevResults.length * 2 });
+    } catch (e) {
+      verifyError = e instanceof Error ? e.message : String(e);
+      const isDailyLimit = verifyError === "daily_limit";
+      const hasRecorded = !!opts.recordedJev && Object.keys(opts.recordedJev).length > 0;
+      if (isDailyLimit && hasRecorded) {
+        jevMode = "replay";
+        onStage("notice", { message: "Daily demo limit reached — switching to Replay mode" });
+        verifyError = null;
+      } else if (isDailyLimit) {
+        onStage("notice", { message: "Daily demo limit reached — live Jev calls are capped at 200 per day" });
+        verifyError = null;
+        jevMode = "replay";
+      }
     }
+  } else {
+    onStage("notice", { message: "Supabase not configured — using recorded Jev answers (Replay mode)" });
+    jevMode = "replay";
   }
 
   if (verifyError) {
@@ -219,6 +282,10 @@ export async function runCheck(opts: RunOptions): Promise<CheckReport> {
   const explainStart = Date.now();
   await Promise.all(
     claims.map(async (c) => {
+      if (!supabaseConfigured) {
+        c.reasoning = mockReasoning(c.verdict, c.code_checks);
+        return;
+      }
       try {
         const res = await invokeFn<{ reasoning: string; suggested_fix: string | null; mode: "live" | "mock" }>("explain", {
           claim: c.text,
@@ -229,7 +296,7 @@ export async function runCheck(opts: RunOptions): Promise<CheckReport> {
         c.reasoning = res.reasoning;
         c.suggested_fix = res.suggested_fix;
       } catch {
-        c.reasoning = null;
+        c.reasoning = mockReasoning(c.verdict, c.code_checks);
       }
     })
   );
@@ -270,6 +337,7 @@ export async function runCheck(opts: RunOptions): Promise<CheckReport> {
 
 // ---- Persistence ----
 export async function saveCheck(report: CheckReport): Promise<string> {
+  if (!supabaseConfigured) return "";
   const { data: checkRow, error: checkErr } = await supabase
     .from("checks")
     .insert({
@@ -340,6 +408,7 @@ export async function saveCheck(report: CheckReport): Promise<string> {
 }
 
 export async function loadCheck(id: string): Promise<CheckReport | null> {
+  if (!supabaseConfigured) return null;
   const [{ data: check }, { data: sources }, { data: claims }] = await Promise.all([
     supabase.from("checks").select("*").eq("id", id).maybeSingle(),
     supabase.from("sources").select("*").eq("check_id", id),
@@ -399,6 +468,7 @@ export async function loadCheck(id: string): Promise<CheckReport | null> {
 }
 
 export async function listPastChecks(): Promise<{ id: string; title: string; trust_score: number | null; grade: string | null; created_at: string }[]> {
+  if (!supabaseConfigured) return [];
   const { data, error } = await supabase
     .from("checks")
     .select("id, title, trust_score, grade, created_at")

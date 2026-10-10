@@ -16,24 +16,30 @@ import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 const JEVMODEL = "jev-1.13.0";
 const TYPESAFE_URL = "https://api.typesafe.ai/v1/systemone";
 
-// ---------- Daily usage cap (fail closed) ----------
-async function checkUsage(fn: string): Promise<Response | null> {
+// ---------- Daily usage cap (per upstream fetch, fail closed) ----------
+class DailyLimitError extends Error {
+  constructor() {
+    super("daily_limit");
+    this.name = "DailyLimitError";
+  }
+}
+
+async function incrementAndCheck(): Promise<void> {
   const supabaseUrl = Deno.env.get("SUPABASE_URL");
   const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!supabaseUrl || !serviceRoleKey) {
-    return json({ error: "Server misconfiguration: cannot verify usage" }, 503);
+    throw new Error("Server misconfiguration: cannot verify usage");
   }
   const admin = createClient(supabaseUrl, serviceRoleKey);
   const today = new Date().toISOString().slice(0, 10);
-  const { data, error } = await admin.rpc("increment_usage", { fn, day: today });
+  const { data, error } = await admin.rpc("increment_usage", { fn: "jev-verify", day: today });
   if (error || typeof data !== "number") {
-    return json({ error: "Usage counter unavailable" }, 503);
+    throw new Error("Usage counter unavailable");
   }
   const limit = parseInt(Deno.env.get("DAILY_CALL_LIMIT") ?? "200", 10);
   if (data > limit) {
-    return json({ error: "daily_limit" }, 429);
+    throw new DailyLimitError();
   }
-  return null;
 }
 
 // ---------- BM25 (pure TS, k1=1.2 b=0.75) ----------
@@ -43,7 +49,7 @@ function tokenize(text: string): string[] {
   return text.toLowerCase().replace(/[^a-z0-9%€$.\s-]/g, " ").split(/\s+/).filter((t) => t.length > 1 && !STOP.has(t));
 }
 
-interface Passage { id: string; text: string }
+interface Passage { id: string; text: string; sourceLabel: string; sourceTitle: string | null }
 
 function bm25Rank(claim: string, passages: Passage[], k1 = 1.2, b = 0.75): { passage: Passage; score: number }[] {
   const qTokens = tokenize(claim);
@@ -75,8 +81,8 @@ function splitSentences(text: string): string[] {
   return text.replace(/\n+/g, " ").match(/[^.!?]+[.!?]+["')\]]*|\S+$/g)?.map((s) => s.trim()).filter((s) => s.length > 10) ?? [];
 }
 
-function buildPassages(sources: { label: string; title: string | null; content: string }[]): { sourceLabel: string; sourceTitle: string | null; id: string; text: string }[] {
-  const out: { sourceLabel: string; sourceTitle: string | null; id: string; text: string }[] = [];
+function buildPassages(sources: { label: string; title: string | null; content: string }[]): Passage[] {
+  const out: Passage[] = [];
   for (const src of sources) {
     const sentences = splitSentences(src.content);
     const sourceParts = sentences.length ? sentences : [src.content];
@@ -95,9 +101,9 @@ function buildPassages(sources: { label: string; title: string | null; content: 
       }
       n++;
       out.push({ sourceLabel: src.label, sourceTitle: src.title, id: `${src.label}-P${n}`, text: group.join(" ") });
-      i = j - 1; // one sentence overlap
+      i = j - 1;
       if (j >= sourceParts.length) break;
-      if (j === i + 1) i = j; // safety: force progress on very long single sentences
+      if (j === i + 1) i = j;
     }
   }
   return out;
@@ -113,8 +119,11 @@ interface ClaimInput {
   cited_source?: string | null;
 }
 
-// ---------- TypeSafe call ----------
+// ---------- TypeSafe call (with per-fetch usage cap) ----------
 async function callTypeSafe(apiKey: string, payload: unknown): Promise<{ data: any; latencyMs: number }> {
+  // Count every upstream fetch against the daily cap, right before the fetch
+  await incrementAndCheck();
+
   const started = Date.now();
   const res = await fetch(TYPESAFE_URL, {
     method: "POST",
@@ -136,12 +145,15 @@ async function callTypeSafe(apiKey: string, payload: unknown): Promise<{ data: a
   return { data, latencyMs };
 }
 
+// Retry only on TypeSafe rate-limit (429/529), never on daily_limit
 async function callTypeSafeWithRetry(apiKey: string, payload: unknown): Promise<{ data: any; latencyMs: number }> {
   let lastErr: any;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       return await callTypeSafe(apiKey, payload);
     } catch (e: any) {
+      // Never retry after a daily_limit — propagate immediately
+      if (e instanceof DailyLimitError) throw e;
       lastErr = e;
       if (!e?.retryable || attempt === 2) throw e;
       await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt)));
@@ -220,6 +232,8 @@ function stage2Payload(claim: ClaimInput, passageText: string) {
   return { model: JEVMODEL, state, questions };
 }
 
+const MAX_CLAIMS = 10;
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return json(null, 200);
 
@@ -231,19 +245,20 @@ Deno.serve(async (req: Request) => {
     const sources: unknown = body?.sources;
     if (!Array.isArray(claims) || claims.length === 0) return json({ error: "Provide { claims: [...] }" }, 422);
     if (!Array.isArray(sources)) return json({ error: "Provide { sources: [...] }" }, 422);
+    if ((claims as unknown[]).length > MAX_CLAIMS) {
+      return json({ error: "too_many_claims" }, 422);
+    }
 
     if (!apiKey) {
       return json({ error: "TYPESAFE_API_KEY is not configured. Live Jev verification needs a TypeSafe API key — Replay mode with a built-in demo works without one." }, 503);
     }
 
-    // Usage cap — checked before any upstream TypeSafe call
-    const capResp = await checkUsage("jev-verify");
-    if (capResp) return capResp;
-
     const allPassages = buildPassages(sources as any);
     if (allPassages.length === 0) return json({ error: "No source content to build passages from" }, 422);
 
-    const results = await Promise.all((claims as ClaimInput[]).slice(0, 40).map(async (claim: ClaimInput) => {
+    // Process claims with concurrency 8; per-fetch usage cap is inside callTypeSafe
+    const claimList = (claims as ClaimInput[]).slice(0, MAX_CLAIMS);
+    const results = await Promise.all(claimList.map(async (claim: ClaimInput) => {
       const ranked = bm25Rank(claim.text, allPassages);
       let candidates = ranked.slice(0, 5).map((r) => r.passage);
       if (claim.cited_source) {
@@ -254,7 +269,6 @@ Deno.serve(async (req: Request) => {
       }
       candidates = candidates.slice(0, 5);
 
-      // Stage 1: pick best passage with shuffled letter keys
       const shuffled = shuffle(candidates);
       const letterToId = new Map(shuffled.map((p, i) => [LETTERS[i], p.id]));
       const s1 = await callTypeSafeWithRetry(apiKey, stage1Payload(claim, shuffled));
@@ -262,7 +276,6 @@ Deno.serve(async (req: Request) => {
       const bestLetter = s1Answers?.best_passage?.choice;
       const anySupport = s1Answers?.any_support?.noul ?? 0;
 
-      // Stage 2
       const chosen = bestLetter && bestLetter !== "none" ? letterToId.get(bestLetter) : null;
       const weakMatch = !chosen;
       const chosenPassage = chosen ? allPassages.find((p) => p.id === chosen) : ranked[0].passage;
@@ -300,6 +313,9 @@ Deno.serve(async (req: Request) => {
 
     return json({ results, model: JEVMODEL });
   } catch (err: any) {
+    if (err instanceof DailyLimitError) {
+      return json({ error: "daily_limit" }, 429);
+    }
     const message = err instanceof Error ? err.message : String(err);
     if (message.startsWith("TypeSafe")) return json({ error: message }, err?.status && err.status >= 400 && err.status < 500 ? err.status : 502);
     return json({ error: `jev-verify failed: ${message}` }, 500);

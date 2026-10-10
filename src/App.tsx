@@ -21,6 +21,7 @@ import { InputView } from "@/components/InputView";
 import { PipelineStrip } from "@/components/PipelineStrip";
 import { ReportView } from "@/components/ReportView";
 import { runCheck, saveCheck, loadCheck, listPastChecks } from "@/lib/pipeline";
+import { supabaseConfigured } from "@/lib/supabaseClient";
 import { DEMOS, demoBySlug, demoSources } from "@/lib/demos";
 import type { Source, CheckReport } from "@/lib/types";
 import { reportToMarkdown, reportToJson, download } from "@/lib/exportReport";
@@ -175,6 +176,12 @@ export default function App() {
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-8 space-y-8">
         {/* Notices / errors */}
         <AnimatePresence>
+          {!supabaseConfigured && (
+            <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="flex items-start gap-2 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 p-3 text-sm text-amber-700 dark:text-amber-300">
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+              Supabase is not configured. Demos still work in Mock + Replay mode, but live calls, report saving, and past checks are disabled. Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to enable everything.
+            </motion.div>
+          )}
           {(error || notices.length > 0) && (
             <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="space-y-2">
               {error && (

@@ -1,18 +1,20 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string;
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string;
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
 
-if (!supabaseUrl || !supabaseAnonKey) {
-  throw new Error("Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY");
-}
+export const supabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+export const supabase: SupabaseClient = supabaseConfigured
+  ? createClient(supabaseUrl!, supabaseAnonKey!)
+  : (null as unknown as SupabaseClient);
 
 export async function invokeFn<T>(name: string, body: Record<string, unknown>): Promise<T> {
+  if (!supabaseConfigured) {
+    throw new Error("Supabase is not configured — set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to enable live calls. Demos still work in Replay mode.");
+  }
   const { data, error } = await supabase.functions.invoke(name, { body });
   if (error) {
-    // functions.invoke surfaces HTTP errors as FunctionHttpError with context
     const ctx = (error as unknown as { context?: Record<string, unknown> }).context;
     const ctxError = ctx && typeof ctx === "object" && typeof ctx.error === "string" ? ctx.error : null;
     throw new Error(ctxError ?? error.message);

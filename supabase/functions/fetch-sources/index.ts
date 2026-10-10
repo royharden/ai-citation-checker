@@ -25,21 +25,88 @@ function isPrivateHost(hostname: string): boolean {
   if (m) {
     const [a, b] = [Number(m[1]), Number(m[2])];
     if (a === 0 || a === 10 || a === 127) return true;
-    if (a === 169 && b === 254) return true;
+    if (a === 169 && b === 254) return true; // link-local
     if (a === 172 && b >= 16 && b <= 31) return true;
     if (a === 192 && b === 168) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true;
-    if (a >= 224) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a >= 224) return true; // multicast/reserved
     return false;
   }
-  // metadata endpoints by name
-  if (h === "metadata.google.internal" || h.endsWith(".compute.internal")) return true;
+  // cloud metadata endpoints by name
+  if (h === "metadata.google.internal" || h.endsWith(".compute.internal") || h === "169.254.169.254") return true;
   return false;
+}
+
+function isUrlAllowed(rawUrl: string): { ok: true; url: URL } | { ok: false; reason: string } {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    return { ok: false, reason: "Not a valid URL" };
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { ok: false, reason: "Only http and https are allowed" };
+  }
+  if (isPrivateHost(parsed.hostname)) {
+    return { ok: false, reason: "Refused: local, loopback, link-local, private, and metadata addresses are not allowed" };
+  }
+  return { ok: true, url: parsed };
+}
+
+const MAX_REDIRECTS = 3;
+const MAX_BYTES = 2 * 1024 * 1024;
+const FETCH_TIMEOUT_MS = 10_000;
+
+async function fetchWithRedirects(startUrl: URL): Promise<{ response: Response; finalUrl: string } | { error: string }> {
+  let currentUrl = startUrl;
+  let lastResponse: Response | null = null;
+
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const check = isUrlAllowed(currentUrl.toString());
+    if (!check.ok) return { error: check.reason };
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(currentUrl.toString(), {
+        signal: controller.signal,
+        redirect: "manual",
+        headers: { "User-Agent": "CitationCheckerDemo/1.0 (+source fetcher)" },
+      });
+
+      // Manual redirect handling (3xx)
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get("location");
+        if (!location) return { error: `Redirect with no Location header (HTTP ${res.status})` };
+        // Resolve relative URLs against the current URL
+        let nextUrl: URL;
+        try {
+          nextUrl = new URL(location, currentUrl);
+        } catch {
+          return { error: `Invalid redirect Location: ${location}` };
+        }
+        currentUrl = nextUrl;
+        continue; // re-check isPrivateHost on next iteration
+      }
+
+      lastResponse = res;
+      break;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { error: msg.includes("abort") ? "Timed out after 10 seconds" : `Fetch failed: ${msg}` };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  if (!lastResponse) {
+    return { error: `Too many redirects (max ${MAX_REDIRECTS})` };
+  }
+  return { response: lastResponse, finalUrl: currentUrl.toString() };
 }
 
 function extractMainText(html: string): string {
   let text = html;
-  // Drop script/style/nav/footer/svg blocks
   text = text.replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
     .replace(/<nav[\s\S]*?<\/nav>/gi, " ")
@@ -71,41 +138,44 @@ Deno.serve(async (req: Request) => {
     const results = await Promise.all(urls.map(async (raw: unknown) => {
       const fail = (error: string) => ({ url: typeof raw === "string" ? raw : "", title: null, text: "", error });
       if (typeof raw !== "string" || raw.trim() === "") return fail("Empty URL");
-      let parsed: URL;
-      try {
-        parsed = new URL(raw.trim());
-      } catch {
-        return fail("Not a valid URL");
-      }
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return fail("Only http and https are allowed");
-      if (isPrivateHost(parsed.hostname)) return fail("Refused: local and private addresses are not allowed");
 
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 10_000);
-      try {
-        const res = await fetch(parsed.toString(), {
-          signal: controller.signal,
-          redirect: "follow",
-          headers: { "User-Agent": "CitationCheckerDemo/1.0 (+source fetcher)" },
-        });
-        if (!res.ok) return fail(`Fetch failed: HTTP ${res.status}`);
-        const contentType = res.headers.get("content-type") ?? "";
-        if (!contentType.includes("text/html") && !contentType.includes("text/plain") && !contentType.includes("xml")) {
-          return fail(`Unsupported content type: ${contentType || "unknown"}`);
-        }
-        const buf = await res.arrayBuffer();
-        if (buf.byteLength > 2 * 1024 * 1024) return fail("Page too large (over 2 MB)");
-        const raw = new TextDecoder("utf-8", { fatal: false }).decode(buf);
-        const text = contentType.includes("text/html") ? extractMainText(raw) : raw.trim();
-        const titleMatch = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-        const title = titleMatch ? titleMatch[1].replace(/\s+/g, " ").trim() : parsed.hostname;
-        return { url: parsed.toString(), title, text, error: null };
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return fail(msg.includes("abort") ? "Timed out after 10 seconds" : `Fetch failed: ${msg}`);
-      } finally {
-        clearTimeout(timer);
+      const initialCheck = isUrlAllowed(raw);
+      if (!initialCheck.ok) return fail(initialCheck.reason);
+
+      const fetchResult = await fetchWithRedirects(initialCheck.url);
+      if ("error" in fetchResult) return fail(fetchResult.error);
+
+      const res = fetchResult.response;
+      if (!res.ok) return fail(`Fetch failed: HTTP ${res.status}`);
+
+      const contentType = res.headers.get("content-type") ?? "";
+      if (!contentType.includes("text/html") && !contentType.includes("text/plain") && !contentType.includes("xml")) {
+        return fail(`Unsupported content type: ${contentType || "unknown"}`);
       }
+
+    // Stream-cap: read up to MAX_BYTES + 1 to detect overflow
+    const reader = res.body?.getReader();
+    if (!reader) return fail("No response body");
+    const chunks: Uint8Array[] = [];
+    let totalLen = 0;
+    let oversized = false;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalLen += value.byteLength;
+      if (totalLen > MAX_BYTES) { oversized = true; break; }
+      chunks.push(value);
+    }
+    if (oversized) return fail("Page too large (over 2 MB)");
+
+    const buf = new Uint8Array(totalLen);
+    let pos = 0;
+    for (const c of chunks) { buf.set(c, pos); pos += c.byteLength; }
+    const rawText = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+      const text = contentType.includes("text/html") ? extractMainText(rawText) : rawText.trim();
+      const titleMatch = rawText.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+      const title = titleMatch ? titleMatch[1].replace(/\s+/g, " ").trim() : initialCheck.url.hostname;
+      return { url: fetchResult.finalUrl, title, text, error: null };
     }));
 
     return json({ results });
