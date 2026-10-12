@@ -65,6 +65,8 @@ npm run dev
 | `OPENAI_API_KEY` | for live LLM | — | Edge Function secret (server-only) |
 | `OPENAI_MODEL` | no | `gpt-6-luna` | Edge Function secret (server-only) |
 | `OPENAI_BASE_URL` | no | `https://api.openai.com/v1` | Edge Function secret (server-only) |
+| `DAILY_CALL_LIMIT` | no | `200` | Edge Function secret (server-only): max upstream TypeSafe/OpenAI calls per function per UTC day |
+| `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | yes (auto-provided by Supabase) | — | Edge Function env only; used for the usage counter, never sent to the browser |
 | `VITE_SUPABASE_URL` | yes | — | Public (browser bundle) |
 | `VITE_SUPABASE_ANON_KEY` | yes | — | Public (browser bundle) |
 
@@ -106,5 +108,6 @@ _(placeholders)_
 - **The LLM writes but never decides.** `explain` only restates facts from the matched passage and suggests a corrected claim — it can't overturn a verdict.
 - **No temperature, ever.** Chat requests send only `model`, `messages`, and `response_format: {"type": "json_object"}` — not in retries or fallbacks either (gpt-6-luna rejects temperature).
 - **Labeled Replay fixtures.** Recorded Jev answers are always badged, never passed off as live inference.
-- **SSRF-safe fetching.** `fetch-sources` allows only http/https, refuses localhost and private IP ranges, enforces a 10 s timeout and 2 MB cap, and extracts readable main text.
+- **SSRF-safe fetching.** `fetch-sources` allows only http/https and refuses localhost, `*.internal`, metadata hosts and every private, loopback, link-local, CGNAT, unique-local, multicast/reserved and `::ffff:`-mapped address. It resolves A and AAAA records before every request and every redirect (max 3, followed manually), fails closed on DNS errors, and enforces a 10 s overall timeout and a 2 MB streamed size cap.
+- **Abuse limits.** Every Edge Function requires the anon JWT (`verify_jwt = true`). Each upstream TypeSafe/OpenAI call, retries included, is counted first in `usage_counters` via the service-role-only `increment_usage` RPC; over the daily cap the function returns `429 {"error":"daily_limit"}` and the app switches to Replay. If the counter is unavailable the function fails closed with 503. Requests are bounded: 300 KB body, 20,000-character answers, 2,000-character claims and passages, 10 claims and 200 KB of sources per `jev-verify` call (413/422 above that).
 - **Reproducible math in code:** BM25 (k1 = 1.2, b = 0.75) ranks passages; cost = input tokens × $0.042/M; latency measured per request; p95 computed from per-claim totals.

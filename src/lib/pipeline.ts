@@ -1,6 +1,8 @@
-import { invokeFn, supabase, supabaseConfigured } from "./supabaseClient";
+import { invokeFn, isDailyLimitError, supabase, supabaseConfigured } from "./supabaseClient";
 import type { RawClaim, Source, JevVerifyResult, Verdict, ClaimReport, CheckReport, Passage, CodeChecks } from "./types";
 import { runCodeChecks, adjustVerdict, trustScore } from "./checks";
+
+const DAILY_LIMIT_NOTICE = "Daily demo limit reached - switching to Replay mode";
 
 export function findCharSpan(answer: string, text: string): { start: number; end: number } | null {
   const direct = answer.indexOf(text);
@@ -136,17 +138,12 @@ export async function runCheck(opts: RunOptions): Promise<CheckReport> {
       jevResults = res.results;
       onStage("jev", { status: "done", ms: Date.now() - jevStart, calls: jevResults.length * 2 });
     } catch (e) {
-      verifyError = e instanceof Error ? e.message : String(e);
-      const isDailyLimit = verifyError === "daily_limit";
-      const hasRecorded = !!opts.recordedJev && Object.keys(opts.recordedJev).length > 0;
-      if (isDailyLimit && hasRecorded) {
+      // A 429 whose body (error.context) says daily_limit switches to Replay instead of failing
+      if (isDailyLimitError(e)) {
         jevMode = "replay";
-        onStage("notice", { message: "Daily demo limit reached — switching to Replay mode" });
-        verifyError = null;
-      } else if (isDailyLimit) {
-        onStage("notice", { message: "Daily demo limit reached — live Jev calls are capped at 200 per day" });
-        verifyError = null;
-        jevMode = "replay";
+        onStage("notice", { message: DAILY_LIMIT_NOTICE });
+      } else {
+        verifyError = e instanceof Error ? e.message : String(e);
       }
     }
   } else {
