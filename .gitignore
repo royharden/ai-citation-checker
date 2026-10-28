@@ -22,4 +22,15 @@ dist-ssr
 *.sw?
 .env
 .env.*
-!.env.example
+
+# Local secrets and generated artifacts
+.creds/
+ArchiveManager-creds.txt
+*.pem
+*.key
+*.p12
+*.pfx
+*.zip
+.cache/
+coverage/
+build/
